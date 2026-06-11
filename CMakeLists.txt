@@ -18,7 +18,14 @@ add_executable(Im_function
     main.cpp
     ImageConcat.cpp
     ImageBlend.cpp
+    ImageBlendAvx2.cpp
 )
+
+if(MSVC)
+    set_source_files_properties(ImageBlendAvx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(ImageBlendAvx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+endif()
 
 target_include_directories(Im_function PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

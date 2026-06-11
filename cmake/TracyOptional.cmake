@@ -31,7 +31,8 @@ function(im_function_link_tracy target_name)
     # third_party/tracy 请保持在 v0.13.1；若用更新源码，需自行编译同版本 profiler。
 
     set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
-    set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
+    # 短生命周期程序若开启 ON_DEMAND，Tracy 未连接时 zone 不会记录且进程很快退出。
+    set(TRACY_ON_DEMAND OFF CACHE BOOL "" FORCE)
 
     add_subdirectory("${_tracy_src}" "${CMAKE_BINARY_DIR}/tracy" EXCLUDE_FROM_ALL)
 

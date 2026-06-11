@@ -1,4 +1,5 @@
 #include "ImageBlend.h"
+#include "ImageBlendSimd.h"
 #include "Profiling.h"
 #include <cmath>
 #include <algorithm>
@@ -15,9 +16,8 @@ namespace
 	constexpr float kFlatBrightRatio = 0.15f;
 	constexpr int kFlatMinBrightPixels = 64;
 	constexpr float kSphereBodyBrightRatio = 0.12f;
-	constexpr float kSphereHighlightRatio = 0.85f;
 	constexpr int kSphereMinBodyPixels = 128;
-	constexpr int kSphereMinHighlightPixels = 8;
+	constexpr int kSphereMinDiffusePixels = 64;
 	constexpr float kSphereMinRadius = 8.f;
 
 	// 平板亮区
@@ -69,42 +69,51 @@ namespace
 		return stats;
 	}
 
-	// 平板亮区质心转换为光源方向
-	cv::Vec3f flatCentroidToLightDir(const cv::Point2f& centroid, const cv::Size& size, bool& ok)
+	// 平板标定：手动俯仰角 + 亮区质心偏航角 -> 光源方向
+	// pitchDeg: 与 +Z 光轴夹角，度，范围 [0, 90)
+	cv::Vec3f flatCentroidPitchToLightDir(
+		const cv::Point2f& centroid,
+		const cv::Size& size,
+		float pitchDeg,
+		bool& ok)
 	{
 		ok = false;
 		const float cx = size.width * 0.5f;
 		const float cy = size.height * 0.5f;
-		cv::Vec3f dir(centroid.x - cx, centroid.y - cy, 1.f);
-		const float norm = cv::norm(dir);
-		if (norm < 1e-6f) return cv::Vec3f();
+		const float du = centroid.x - cx;
+		const float dv = centroid.y - cy;
 
-		dir /= norm;
+		float yaw = 0.f;
+		if (du * du + dv * dv > 1e-12f)
+			yaw = std::atan2(dv, du);
+
+		const float pitchRad = pitchDeg * (static_cast<float>(CV_PI) / 180.f);
+		const float sinPitch = std::sin(pitchRad);
+		const float cosPitch = std::cos(pitchRad);
+		cv::Vec3f dir(
+			sinPitch * std::cos(yaw),
+			sinPitch * std::sin(yaw),
+			cosPitch);
+
 		if (dir[2] < 0.f) dir = -dir;
 		ok = true;
 		return dir;
 	}
 
-	// 反射向量
-	cv::Vec3f reflectVector(const cv::Vec3f& v, const cv::Vec3f& n)
-	{
-		return v - 2.f * v.dot(n) * n;
-	}
-
-	// 球高光
-	struct SphereHighlight
+	// 漫反射球亮区
+	struct DiffuseSphereRegion
 	{
 		cv::Point2f centroid;
 		cv::Point2f center;
 		float radius = 0.f;
-		float meanIntensity = 0.f;
+		float peakIntensity = 0.f;
 		bool valid = false;
 	};
 
-	// 提取球高光
-	SphereHighlight extractSphereHighlight(const cv::Mat& gray)
+	// 提取漫反射球：检测球体轮廓，球内灰度加权质心估计亮区中心
+	DiffuseSphereRegion extractDiffuseSphereRegion(const cv::Mat& gray)
 	{
-		SphereHighlight stats;
+		DiffuseSphereRegion stats;
 		cv::Mat floatImg;
 		gray.convertTo(floatImg, CV_32F);
 
@@ -144,11 +153,11 @@ namespace
 		cv::Mat sphereMask = cv::Mat::zeros(floatImg.size(), CV_8UC1);
 		cv::circle(sphereMask, center, static_cast<int>(std::round(radius)), cv::Scalar(255), cv::FILLED);
 
-		const float highlightThreshold = static_cast<float>(maxVal * kSphereHighlightRatio);
 		double sumW = 0.0;
 		double sumX = 0.0;
 		double sumY = 0.0;
 		int count = 0;
+		float peakIntensity = 0.f;
 
 		for (int y = 0; y < floatImg.rows; ++y)
 		{
@@ -159,29 +168,31 @@ namespace
 				if (maskRow[x] == 0) continue;
 
 				const float v = row[x];
-				if (v < highlightThreshold) continue;
+				if (v <= 0.f) continue;
 
 				sumW += v;
 				sumX += v * x;
 				sumY += v * y;
+				peakIntensity = std::max(peakIntensity, v);
 				++count;
 			}
 		}
 
-		if (count < kSphereMinHighlightPixels || sumW <= 0.0) return stats;
+		if (count < kSphereMinDiffusePixels || sumW <= 0.0 || peakIntensity <= 0.f)
+			return stats;
 
 		stats.centroid = cv::Point2f(static_cast<float>(sumX / sumW), static_cast<float>(sumY / sumW));
-		stats.meanIntensity = static_cast<float>(sumW / count);
+		stats.peakIntensity = peakIntensity;
 		stats.valid = true;
 		return stats;
 	}
 
-	// 球高光法线
-	cv::Vec3f sphereNormalAtHighlight(const SphereHighlight& highlight, bool& ok)
+	// 漫反射球亮区质心处的球面外法线
+	cv::Vec3f sphereNormalAtPoint(const DiffuseSphereRegion& region, bool& ok)
 	{
 		ok = false;
-		const float rx = (highlight.centroid.x - highlight.center.x) / highlight.radius;
-		const float ry = (highlight.centroid.y - highlight.center.y) / highlight.radius;
+		const float rx = (region.centroid.x - region.center.x) / region.radius;
+		const float ry = (region.centroid.y - region.center.y) / region.radius;
 		const float rr2 = rx * rx + ry * ry;
 		if (rr2 >= 1.f) return cv::Vec3f();
 
@@ -195,28 +206,15 @@ namespace
 		return normal;
 	}
 
-	// 球高光转换为光源方向
-	cv::Vec3f highlightToLightDir(
-		const SphereHighlight& highlight,
-		const cv::Size& size,
-		bool& ok)
+	// 漫反射球：Lambert 模型下亮区法线即光源方向
+	cv::Vec3f diffuseSphereToLightDir(const DiffuseSphereRegion& region, bool& ok)
 	{
 		ok = false;
 
 		bool normalOk = false;
-		const cv::Vec3f normal = sphereNormalAtHighlight(highlight, normalOk);
+		cv::Vec3f lightDir = sphereNormalAtPoint(region, normalOk);
 		if (!normalOk) return cv::Vec3f();
 
-		bool rayOk = false;
-		const cv::Vec3f viewRay = flatCentroidToLightDir(highlight.centroid, size, rayOk);
-		if (!rayOk) return cv::Vec3f();
-
-		const cv::Vec3f viewToCamera = -viewRay;
-		cv::Vec3f lightDir = reflectVector(viewToCamera, normal);
-		const float norm = cv::norm(lightDir);
-		if (norm < 1e-6f) return cv::Vec3f();
-
-		lightDir /= norm;
 		if (lightDir[2] < 0.f) lightDir = -lightDir;
 		ok = true;
 		return lightDir;
@@ -417,6 +415,47 @@ namespace
 		cv::Laplacian(heightMap, curvatureOut, CV_32F, 3);
 	}
 
+	// 加权平均：标量单遍扫描
+	void weightedAverageSinglePassScalar(
+		const std::vector<cv::Mat>& imgs,
+		const std::vector<float>& weights,
+		cv::Mat& resultOut)
+	{
+		const size_t n = imgs.size();
+		CV_Assert(n == weights.size() && n > 0);
+
+		const cv::Size size = imgs[0].size();
+		resultOut.create(size, imgs[0].type());
+
+		const int cols = size.width;
+		const int rows = size.height;
+
+		cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+			for (int y = range.start; y < range.end; ++y)
+			{
+				uchar* dstRow = resultOut.ptr<uchar>(y);
+				for (int x = 0; x < cols; ++x)
+				{
+					float sum = 0.f;
+					for (size_t i = 0; i < n; ++i)
+						sum += weights[i] * static_cast<float>(imgs[i].ptr<uchar>(y)[x]);
+					dstRow[x] = cv::saturate_cast<uchar>(sum);
+				}
+			}
+		});
+	}
+
+	// 加权平均：优先 AVX2，不可用时回退标量
+	void weightedAverageSinglePass(
+		const std::vector<cv::Mat>& imgs,
+		const std::vector<float>& weights,
+		cv::Mat& resultOut)
+	{
+		if (weightedAverageTryAvx2(imgs, weights, resultOut))
+			return;
+		weightedAverageSinglePassScalar(imgs, weights, resultOut);
+	}
+
 	// 渲染合成图
 	void renderSyntheticImage(
 		const cv::Mat& normalMap,
@@ -572,6 +611,15 @@ ImageBlendError ImageBlend::setConfig(ImageBlendMode blendMode, const ImageBlend
 
 	mode = blendMode;
 	config = blendConfig;
+	if (blendMode == ImageBlendMode::WeightedAverage)
+	{
+		auto& cfg = std::get<WeightedAverageConfig>(config);
+		double weightSum = 0.0;
+		for (double w : cfg.weights) weightSum += w;
+		cfg.normalizedWeights.resize(cfg.weights.size());
+		for (size_t i = 0; i < cfg.weights.size(); ++i)
+			cfg.normalizedWeights[i] = static_cast<float>(cfg.weights[i] / weightSum);
+	}
 	configSet = true;
 	releaseOutputs();
 	return ImageBlendError::OK;
@@ -594,7 +642,7 @@ void ImageBlend::initPhotometricStereoMaps(const cv::Size& size, const Photometr
 // 最大值融合
 void ImageBlend::executeMaxValue()
 {
-	ZoneScoped;
+	ZoneScopedN("executeMaxValue");
 	result = imgs[0].clone();
 	for (size_t i = 1; i < imgs.size(); ++i)
 		cv::max(result, imgs[i], result);
@@ -603,19 +651,8 @@ void ImageBlend::executeMaxValue()
 // 加权平均融合
 void ImageBlend::executeWeightedAverage(const WeightedAverageConfig& cfg)
 {
-	ZoneScoped;
-	double weightSum = 0.0;
-	for (double w : cfg.weights) weightSum += w;
-
-	cv::Mat acc;
-	imgs[0].convertTo(acc, CV_64F, cfg.weights[0] / weightSum);
-	for (size_t i = 1; i < imgs.size(); ++i)
-	{
-		cv::Mat temp;
-		imgs[i].convertTo(temp, CV_64F, cfg.weights[i] / weightSum);
-		acc += temp;
-	}
-	acc.convertTo(result, imgs[0].type());
+	ZoneScopedN("executeWeightedAverage");
+	weightedAverageSinglePass(imgs, cfg.normalizedWeights, result);
 }
 
 // 光度立体法融合
@@ -652,12 +689,19 @@ void ImageBlend::executePhotometricStereo(const PhotometricStereoConfig& cfg)
 }
 
 // 漫反射平板标定
-// 假设平板法线为 (0,0,1)，每张图对应一次打光：
-// 1. 亮区加权质心相对图像中心 -> 光源方向 normalize(du, dv, 1)
-// 2. 亮区平均灰度 / lz -> 相对光强，最后归一化
-ImageBlendError ImageBlend::calibrateFlatPanel(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights)
+// 假设平板法线为 (0,0,1)，每张图对应一次打光，所有光源共用同一俯仰角 pitchDeg：
+// 1. 亮区加权质心 -> 偏航角 yaw = atan2(dv, du)
+// 2. 手动俯仰角 pitchDeg 与 yaw 合成 dir = (sin(p)cos(y), sin(p)sin(y), cos(p))
+// 3. 亮区平均灰度 / lz -> 相对光强，最后归一化
+ImageBlendError ImageBlend::calibrateFlatPanel(
+	const std::vector<cv::Mat>& images,
+	float pitchDeg,
+	std::vector<LightSource>& outLights)
 {
 	ZoneScoped;
+	if (pitchDeg < 0.f || pitchDeg >= 90.f)
+		return ImageBlendError::ParameterError;
+
 	const cv::Size size = images[0].size();
 	const size_t n = images.size();
 	outLights.clear();
@@ -673,7 +717,7 @@ ImageBlendError ImageBlend::calibrateFlatPanel(const std::vector<cv::Mat>& image
 			return ImageBlendError::ParameterError;
 
 		bool dirOk = false;
-		const cv::Vec3f dir = flatCentroidToLightDir(region.centroid, size, dirOk);
+		const cv::Vec3f dir = flatCentroidPitchToLightDir(region.centroid, size, pitchDeg, dirOk);
 		if (!dirOk || dir[2] < kNormalZEpsilon)
 			return ImageBlendError::ParameterError;
 
@@ -697,15 +741,14 @@ ImageBlendError ImageBlend::calibrateFlatPanel(const std::vector<cv::Mat>& image
 	return ImageBlendError::OK;
 }
 
-// 镜面球标定
+// 漫反射球标定
 // 1. 检测球体轮廓（亮区最大连通域 + 最小外接圆）
-// 2. 球内高光加权质心
-// 3. 球面法线 + 反射定律求光源方向（视线由高光像素与图像中心计算，不使用相机内参）
-// 4. 高光强度归一化
+// 2. 球内灰度加权质心 -> 亮区中心
+// 3. Lambert 模型：亮区质心处球面外法线即光源方向
+// 4. 球内峰值灰度作为相对光强，最后归一化
 ImageBlendError ImageBlend::calibrateSphere(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights)
 {
 	ZoneScoped;
-	const cv::Size size = images[0].size();
 
 	const size_t n = images.size();
 	outLights.clear();
@@ -716,19 +759,19 @@ ImageBlendError ImageBlend::calibrateSphere(const std::vector<cv::Mat>& images, 
 
 	for (size_t i = 0; i < n; ++i)
 	{
-		const SphereHighlight highlight = extractSphereHighlight(images[i]);
-		if (!highlight.valid)
+		const DiffuseSphereRegion region = extractDiffuseSphereRegion(images[i]);
+		if (!region.valid)
 			return ImageBlendError::ParameterError;
 
 		bool dirOk = false;
-		const cv::Vec3f dir = highlightToLightDir(highlight, size, dirOk);
+		const cv::Vec3f dir = diffuseSphereToLightDir(region, dirOk);
 		if (!dirOk || dir[2] < kNormalZEpsilon)
 			return ImageBlendError::ParameterError;
 
 		LightSource light;
 		light.geo.dir = dir;
 		light.calib.attenuation = 1.0f;
-		light.calib.intensity = highlight.meanIntensity;
+		light.calib.intensity = region.peakIntensity;
 		rawIntensities.push_back(light.calib.intensity);
 		outLights.push_back(light);
 	}
@@ -745,12 +788,15 @@ ImageBlendError ImageBlend::calibrateSphere(const std::vector<cv::Mat>& images, 
 	return ImageBlendError::OK;
 }
 
-ImageBlendError ImageBlend::executeFlatCalibration(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights)
+ImageBlendError ImageBlend::executeFlatCalibration(
+	const std::vector<cv::Mat>& images,
+	float pitchDeg,
+	std::vector<LightSource>& outLights)
 {
 	ImageBlendError err = validateImages(images, 4);
 	if (err != ImageBlendError::OK) return err;
 
-	return calibrateFlatPanel(images, outLights);
+	return calibrateFlatPanel(images, pitchDeg, outLights);
 }
 
 ImageBlendError ImageBlend::executeSphereCalibration(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights)

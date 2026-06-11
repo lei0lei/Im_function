@@ -2,6 +2,32 @@
 #include "ImageBlend.h"
 #include "Profiling.h"
 
+#if defined(IM_FUNCTION_USE_TRACY)
+#include <tracy/Tracy.hpp>
+#include <chrono>
+#include <thread>
+#include <cstdio>
+
+namespace
+{
+	// 程序很快结束会导致 Tracy 来不及连接；先跑完测试再等待上传。
+	void tracyWaitForProfilerUpload()
+	{
+		std::fprintf(stderr, "Tracy: waiting for profiler connection (up to 120s)...\n");
+		for (int i = 0; i < 12000; ++i)
+		{
+			if (tracy::GetProfiler().IsConnected())
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(500));
+				return;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		std::fprintf(stderr, "Tracy: no connection, exiting.\n");
+	}
+}
+#endif
+
 // 融合测试
 void testBlend()
 {
@@ -15,6 +41,7 @@ void testBlend()
 	std::vector<cv::Mat> images = { img1, img2, img3, img4 };
 
 	{
+		ZoneScopedN("blendMaxValue");
 		ImageBlend blend;
 		if (blend.setImages(images) == ImageBlendError::OK
 			&& blend.setConfig(ImageBlendMode::MaxValue, MaxValueConfig{}) == ImageBlendError::OK
@@ -25,6 +52,7 @@ void testBlend()
 	}
 
 	{
+		ZoneScopedN("blendWeightedAverage");
 		ImageBlend blend;
 		if (blend.setImages(images) == ImageBlendError::OK
 			&& blend.setConfig(ImageBlendMode::WeightedAverage, WeightedAverageConfig{ { 0.4, 0.3, 0.2, 0.1 } }) == ImageBlendError::OK
@@ -115,7 +143,8 @@ void testFlatCalibration()
 
 	ImageBlend calibrator;
 	std::vector<LightSource> lights;
-	if (calibrator.executeFlatCalibration(images, lights) != ImageBlendError::OK) return;
+	const float flatPitchDeg = 45.f; // 手动测量的共用俯仰角 [0, 90)，度
+	if (calibrator.executeFlatCalibration(images, flatPitchDeg, lights) != ImageBlendError::OK) return;
 
 	LightSystem lightSystem;
 	lightSystem.lights = lights;
@@ -133,7 +162,7 @@ void testFlatCalibration()
 	cv::imwrite("blend_ps_calib_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
 }
 
-// 球标定测试（需标定球图像；当前 data 非球体时会标定失败并跳过）
+// 漫反射球标定测试（需漫反射标定球图像；当前 data 非球体时会标定失败并跳过）
 void testSphereCalibration()
 {
 	ZoneScopedN("testSphereCalibration");
@@ -192,9 +221,12 @@ int main()
 	FrameMark;
 	// testConcat();
 	testBlend();
-	testPhotometricStereo();
-	testFlatCalibration();
-	testSphereCalibration();
+	// testPhotometricStereo();
+	// testFlatCalibration();
+	// testSphereCalibration();
 	FrameMark;
+#if defined(IM_FUNCTION_USE_TRACY)
+	tracyWaitForProfilerUpload();
+#endif
 	return 0;
 }

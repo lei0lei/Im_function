@@ -37,6 +37,8 @@ struct MaxValueConfig
 struct WeightedAverageConfig
 {
 	std::vector<double> weights;
+	// setConfig 内根据 weights 预计算，用户无需填写
+	std::vector<float> normalizedWeights;
 };
 
 // 光度立体法输出选项（高度图/曲率图较慢，按需计算）
@@ -74,11 +76,14 @@ public:
 	ImageBlendError setConfig(ImageBlendMode mode, const ImageBlendConfig& config);
 	// 执行融合
 	ImageBlendError execute();
-	// 平板标定：输入>=4张灰度图，输出与输入等数量的 LightSource（按序一一对应）
-	// 光方向由亮区质心与图像中心计算，不使用相机内参
-	ImageBlendError executeFlatCalibration(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights);
-	// 球标定：输入>=4张灰度图，输出与输入等数量的 LightSource（按序一一对应）
-	// 光方向由球内高光、球面法线与图像中心计算，不使用相机内参
+	// 平板标定：输入>=4张灰度图与共用俯仰角 pitchDeg（度，[0,90)），输出与输入等数量的 LightSource
+	// 偏航角由亮区质心相对图像中心估计，俯仰角由 pitchDeg 给定，不使用相机内参
+	ImageBlendError executeFlatCalibration(
+		const std::vector<cv::Mat>& images,
+		float pitchDeg,
+		std::vector<LightSource>& outLights);
+	// 漫反射球标定：输入>=4张灰度图，输出与输入等数量的 LightSource（按序一一对应）
+	// 光方向由球内灰度加权质心处的球面法线估计（Lambert 模型），不使用相机内参
 	ImageBlendError executeSphereCalibration(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights);
 	// 获取融合结果
 	cv::Mat getResult();
@@ -98,7 +103,10 @@ private:
 	void initPhotometricStereoMaps(const cv::Size& size, const PhotometricStereoOutputFlags& flags);
 	ImageBlendError validateImages(const std::vector<cv::Mat>& images, size_t minCount = 1);
 	ImageBlendError validateConfig(ImageBlendMode blendMode, const ImageBlendConfig& config);
-	ImageBlendError calibrateFlatPanel(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights);
+	ImageBlendError calibrateFlatPanel(
+		const std::vector<cv::Mat>& images,
+		float pitchDeg,
+		std::vector<LightSource>& outLights);
 	ImageBlendError calibrateSphere(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights);
 	void executeMaxValue();
 	void executeWeightedAverage(const WeightedAverageConfig& cfg);
