@@ -67,3 +67,14 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+*.tlog
+
+*.jpg
+*.png
+*.jpeg
+*.bmp
+
+build_tracy/
+build_notracy/
+build_notracy_fallback/

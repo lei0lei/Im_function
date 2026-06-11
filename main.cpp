@@ -1,0 +1,200 @@
+#include "ImageConcat.h"
+#include "ImageBlend.h"
+#include "Profiling.h"
+
+// 融合测试
+void testBlend()
+{
+	ZoneScopedN("testBlend");
+	cv::Mat img1 = cv::imread("data\\1.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img2 = cv::imread("data\\2.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img3 = cv::imread("data\\3.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img4 = cv::imread("data\\4.jpg", cv::IMREAD_GRAYSCALE);
+	if (img1.empty() || img2.empty() || img3.empty() || img4.empty()) return;
+
+	std::vector<cv::Mat> images = { img1, img2, img3, img4 };
+
+	{
+		ImageBlend blend;
+		if (blend.setImages(images) == ImageBlendError::OK
+			&& blend.setConfig(ImageBlendMode::MaxValue, MaxValueConfig{}) == ImageBlendError::OK
+			&& blend.execute() == ImageBlendError::OK)
+		{
+			cv::imwrite("blend_max.jpg", blend.getResult());
+		}
+	}
+
+	{
+		ImageBlend blend;
+		if (blend.setImages(images) == ImageBlendError::OK
+			&& blend.setConfig(ImageBlendMode::WeightedAverage, WeightedAverageConfig{ { 0.4, 0.3, 0.2, 0.1 } }) == ImageBlendError::OK
+			&& blend.execute() == ImageBlendError::OK)
+		{
+			cv::imwrite("blend_avg.jpg", blend.getResult());
+		}
+	}
+}
+
+static cv::Vec3f ringLightDirection(float slantRad, float azimuthRad)
+{
+	return cv::Vec3f(
+		std::sin(slantRad) * std::cos(azimuthRad),
+		std::sin(slantRad) * std::sin(azimuthRad),
+		std::cos(slantRad));
+}
+
+static LightSystem buildRingLightSystem(size_t count, float slantDeg)
+{
+	LightSystem sys;
+	sys.lights.resize(count);
+	const float slantRad = slantDeg * static_cast<float>(CV_PI) / 180.f;
+	for (size_t i = 0; i < count; ++i)
+	{
+		const float azimuthRad = static_cast<float>(2.0 * CV_PI * i / count);
+		sys.lights[i].geo.dir = ringLightDirection(slantRad, azimuthRad);
+	}
+	return sys;
+}
+
+static cv::Mat normalMapToBgr8(const cv::Mat& normalMap)
+{
+	cv::Mat vis;
+	normalMap.convertTo(vis, CV_32FC3, 0.5, 0.5);
+	vis.convertTo(vis, CV_8UC3, 255.0);
+	return vis;
+}
+
+static cv::Mat floatMapToGray8(const cv::Mat& map)
+{
+	cv::Mat vis;
+	cv::normalize(map, vis, 0, 255, cv::NORM_MINMAX);
+	vis.convertTo(vis, CV_8UC1);
+	return vis;
+}
+
+// 光度立体融合测试（默认不算高度图/曲率图）
+void testPhotometricStereo()
+{
+	ZoneScopedN("testPhotometricStereo");
+	cv::Mat img1 = cv::imread("data\\1.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img2 = cv::imread("data\\2.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img3 = cv::imread("data\\3.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img4 = cv::imread("data\\4.jpg", cv::IMREAD_GRAYSCALE);
+	if (img1.empty() || img2.empty() || img3.empty() || img4.empty()) return;
+
+	std::vector<cv::Mat> images = { img1, img2, img3, img4 };
+
+	PhotometricStereoOutputFlags outputs;
+	outputs.syntheticLightDir = cv::Vec3f(0.f, 0.f, 1.f);
+	outputs.computeHeightMap = false;
+	outputs.computeCurvatureMap = false;
+
+	LightSystem lightSystem = buildRingLightSystem(images.size(), 45.f);
+
+	ImageBlend blend;
+	if (blend.setImages(images) != ImageBlendError::OK) return;
+	if (blend.setConfig(ImageBlendMode::PhotometricStereo, PhotometricStereoConfig{ lightSystem, outputs }) != ImageBlendError::OK) return;
+	if (blend.execute() != ImageBlendError::OK) return;
+
+	cv::imwrite("blend_ps.jpg", blend.getResult());
+	cv::imwrite("blend_ps_normal.jpg", normalMapToBgr8(blend.getNormalMap()));
+	cv::imwrite("blend_ps_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
+}
+
+// 标定测试：平板标定 -> 光度立体融合
+void testFlatCalibration()
+{
+	ZoneScopedN("testFlatCalibration");
+	cv::Mat img1 = cv::imread("data\\1.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img2 = cv::imread("data\\2.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img3 = cv::imread("data\\3.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img4 = cv::imread("data\\4.jpg", cv::IMREAD_GRAYSCALE);
+	if (img1.empty() || img2.empty() || img3.empty() || img4.empty()) return;
+
+	std::vector<cv::Mat> images = { img1, img2, img3, img4 };
+
+	ImageBlend calibrator;
+	std::vector<LightSource> lights;
+	if (calibrator.executeFlatCalibration(images, lights) != ImageBlendError::OK) return;
+
+	LightSystem lightSystem;
+	lightSystem.lights = lights;
+
+	PhotometricStereoOutputFlags outputs;
+	outputs.syntheticLightDir = cv::Vec3f(0.f, 0.f, 1.f);
+
+	ImageBlend blend;
+	if (blend.setImages(images) != ImageBlendError::OK) return;
+	if (blend.setConfig(ImageBlendMode::PhotometricStereo, PhotometricStereoConfig{ lightSystem, outputs }) != ImageBlendError::OK) return;
+	if (blend.execute() != ImageBlendError::OK) return;
+
+	cv::imwrite("blend_ps_calib.jpg", blend.getResult());
+	cv::imwrite("blend_ps_calib_normal.jpg", normalMapToBgr8(blend.getNormalMap()));
+	cv::imwrite("blend_ps_calib_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
+}
+
+// 球标定测试（需标定球图像；当前 data 非球体时会标定失败并跳过）
+void testSphereCalibration()
+{
+	ZoneScopedN("testSphereCalibration");
+	cv::Mat img1 = cv::imread("data\\1.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img2 = cv::imread("data\\2.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img3 = cv::imread("data\\3.jpg", cv::IMREAD_GRAYSCALE);
+	cv::Mat img4 = cv::imread("data\\4.jpg", cv::IMREAD_GRAYSCALE);
+	if (img1.empty() || img2.empty() || img3.empty() || img4.empty()) return;
+
+	std::vector<cv::Mat> images = { img1, img2, img3, img4 };
+
+	ImageBlend calibrator;
+	std::vector<LightSource> lights;
+	if (calibrator.executeSphereCalibration(images, lights) != ImageBlendError::OK) return;
+
+	LightSystem lightSystem;
+	lightSystem.lights = lights;
+
+	PhotometricStereoOutputFlags outputs;
+	outputs.syntheticLightDir = cv::Vec3f(0.f, 0.f, 1.f);
+
+	ImageBlend blend;
+	if (blend.setImages(images) != ImageBlendError::OK) return;
+	if (blend.setConfig(ImageBlendMode::PhotometricStereo, PhotometricStereoConfig{ lightSystem, outputs }) != ImageBlendError::OK) return;
+	if (blend.execute() != ImageBlendError::OK) return;
+
+	cv::imwrite("blend_ps_sphere.jpg", blend.getResult());
+	cv::imwrite("blend_ps_sphere_normal.jpg", normalMapToBgr8(blend.getNormalMap()));
+	cv::imwrite("blend_ps_sphere_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
+}
+
+
+void testConcat()
+{
+	cv::Mat img1 = cv::imread("data\\1.jpg", -1);
+	cv::Mat img2 = cv::imread("data\\2.jpg", -1);
+	cv::Mat img3 = cv::imread("data\\3.jpg", -1);
+	cv::Mat img4 = cv::imread("data\\4.jpg", -1);
+	std::vector<cv::Mat> images;
+	images.push_back(img1);
+	images.push_back(img2);
+	images.push_back(img3);
+	images.push_back(img4);
+	ImageConcat concat;
+	ImageConcatError res = concat.setInput(images, 2, 2);
+	res = concat.execute();
+	cv::Mat result = concat.getResult();
+	/*cv::imshow("img", result);
+	cv::waitKey(0);*/
+	cv::imwrite("test.jpg", result);
+
+}
+
+int main()
+{
+	FrameMark;
+	// testConcat();
+	testBlend();
+	testPhotometricStereo();
+	testFlatCalibration();
+	testSphereCalibration();
+	FrameMark;
+	return 0;
+}
