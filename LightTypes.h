@@ -2,7 +2,7 @@
 #include <opencv2/core.hpp>
 #include <vector>
 
-// 光源几何
+// 光源方向
 struct LightGeometry
 {
 	cv::Vec3f dir{ 0.f, 0.f, 1.f };

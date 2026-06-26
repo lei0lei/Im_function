@@ -10,7 +10,7 @@
 
 namespace
 {
-	// 程序很快结束会导致 Tracy 来不及连接；先跑完测试再等待上传。
+	// 延迟上传。
 	void tracyWaitForProfilerUpload()
 	{
 		std::fprintf(stderr, "Tracy: waiting for profiler connection (up to 120s)...\n");
@@ -100,7 +100,53 @@ static cv::Mat floatMapToGray8(const cv::Mat& map)
 	return vis;
 }
 
-// 光度立体融合测试（默认不算高度图/曲率图）
+static cv::Mat gradientMapToGray8(const cv::Mat& gradientMap)
+{
+	std::vector<cv::Mat> channels(2);
+	cv::split(gradientMap, channels);
+	cv::Mat magnitude;
+	cv::magnitude(channels[0], channels[1], magnitude);
+	// 固定线性映射（与法线 RGB 一致），避免全图 min-max 把局部浅凹痕压没
+	cv::Mat clamped;
+	cv::min(magnitude, 1.0, clamped);
+	cv::max(clamped, 0.0, clamped);
+	cv::Mat vis;
+	clamped.convertTo(vis, CV_32F, 0.5, 0.5);
+	vis.convertTo(vis, CV_8UC1, 255.0);
+	return vis;
+}
+
+static PhotometricStereoOutputFlags photometricStereoOutputsWithAuxMaps()
+{
+	PhotometricStereoOutputFlags outputs;
+	outputs.syntheticLightDir = cv::Vec3f(0.f, 0.f, 1.f);
+	outputs.computeGradientMap = true;
+	outputs.computeHeightMap = true;
+	outputs.computeCurvatureMap = true;
+	outputs.heightIntegrationScale = 0.5f;
+	return outputs;
+}
+
+static void writePhotometricStereoOutputs(ImageBlend& blend, const std::string& pathPrefix)
+{
+	cv::imwrite(pathPrefix + ".jpg", blend.getResult());
+	cv::imwrite(pathPrefix + "_normal.jpg", normalMapToBgr8(blend.getNormalMap()));
+	cv::imwrite(pathPrefix + "_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
+
+	const cv::Mat gradientMap = blend.getGradientMap();
+	if (!gradientMap.empty())
+		cv::imwrite(pathPrefix + "_gradient.jpg", gradientMapToGray8(gradientMap));
+
+	const cv::Mat heightMap = blend.getHeightMap();
+	if (!heightMap.empty())
+		cv::imwrite(pathPrefix + "_height.jpg", floatMapToGray8(heightMap));
+
+	const cv::Mat curvatureMap = blend.getCurvatureMap();
+	if (!curvatureMap.empty())
+		cv::imwrite(pathPrefix + "_curvature.jpg", floatMapToGray8(curvatureMap));
+}
+
+// 光度立体融合测试
 void testPhotometricStereo()
 {
 	ZoneScopedN("testPhotometricStereo");
@@ -112,10 +158,7 @@ void testPhotometricStereo()
 
 	std::vector<cv::Mat> images = { img1, img2, img3, img4 };
 
-	PhotometricStereoOutputFlags outputs;
-	outputs.syntheticLightDir = cv::Vec3f(0.f, 0.f, 1.f);
-	outputs.computeHeightMap = false;
-	outputs.computeCurvatureMap = false;
+	PhotometricStereoOutputFlags outputs = photometricStereoOutputsWithAuxMaps();
 
 	LightSystem lightSystem = buildRingLightSystem(images.size(), 45.f);
 
@@ -124,9 +167,7 @@ void testPhotometricStereo()
 	if (blend.setConfig(ImageBlendMode::PhotometricStereo, PhotometricStereoConfig{ lightSystem, outputs }) != ImageBlendError::OK) return;
 	if (blend.execute() != ImageBlendError::OK) return;
 
-	cv::imwrite("blend_ps.jpg", blend.getResult());
-	cv::imwrite("blend_ps_normal.jpg", normalMapToBgr8(blend.getNormalMap()));
-	cv::imwrite("blend_ps_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
+	writePhotometricStereoOutputs(blend, "blend_ps");
 }
 
 // 标定测试：平板标定 -> 光度立体融合
@@ -149,17 +190,14 @@ void testFlatCalibration()
 	LightSystem lightSystem;
 	lightSystem.lights = lights;
 
-	PhotometricStereoOutputFlags outputs;
-	outputs.syntheticLightDir = cv::Vec3f(0.f, 0.f, 1.f);
+	PhotometricStereoOutputFlags outputs = photometricStereoOutputsWithAuxMaps();
 
 	ImageBlend blend;
 	if (blend.setImages(images) != ImageBlendError::OK) return;
 	if (blend.setConfig(ImageBlendMode::PhotometricStereo, PhotometricStereoConfig{ lightSystem, outputs }) != ImageBlendError::OK) return;
 	if (blend.execute() != ImageBlendError::OK) return;
 
-	cv::imwrite("blend_ps_calib.jpg", blend.getResult());
-	cv::imwrite("blend_ps_calib_normal.jpg", normalMapToBgr8(blend.getNormalMap()));
-	cv::imwrite("blend_ps_calib_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
+	writePhotometricStereoOutputs(blend, "blend_ps_calib");
 }
 
 // 漫反射球标定测试（需漫反射标定球图像；当前 data 非球体时会标定失败并跳过）
@@ -181,17 +219,14 @@ void testSphereCalibration()
 	LightSystem lightSystem;
 	lightSystem.lights = lights;
 
-	PhotometricStereoOutputFlags outputs;
-	outputs.syntheticLightDir = cv::Vec3f(0.f, 0.f, 1.f);
+	PhotometricStereoOutputFlags outputs = photometricStereoOutputsWithAuxMaps();
 
 	ImageBlend blend;
 	if (blend.setImages(images) != ImageBlendError::OK) return;
 	if (blend.setConfig(ImageBlendMode::PhotometricStereo, PhotometricStereoConfig{ lightSystem, outputs }) != ImageBlendError::OK) return;
 	if (blend.execute() != ImageBlendError::OK) return;
 
-	cv::imwrite("blend_ps_sphere.jpg", blend.getResult());
-	cv::imwrite("blend_ps_sphere_normal.jpg", normalMapToBgr8(blend.getNormalMap()));
-	cv::imwrite("blend_ps_sphere_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
+	writePhotometricStereoOutputs(blend, "blend_ps_sphere");
 }
 
 
@@ -221,7 +256,7 @@ int main()
 	FrameMark;
 	// testConcat();
 	testBlend();
-	// testPhotometricStereo();
+	testPhotometricStereo();
 	// testFlatCalibration();
 	// testSphereCalibration();
 	FrameMark;

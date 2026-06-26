@@ -37,15 +37,18 @@ struct MaxValueConfig
 struct WeightedAverageConfig
 {
 	std::vector<double> weights;
-	// setConfig 内根据 weights 预计算，用户无需填写
+	// setConfig 内根据 weights 预计算
 	std::vector<float> normalizedWeights;
 };
 
-// 光度立体法输出选项（高度图/曲率图较慢，按需计算）
+// 光度立体法输出选项（梯度图/高度图/曲率图较慢，按需计算）
 struct PhotometricStereoOutputFlags
 {
+	bool computeGradientMap = false;
 	bool computeHeightMap = false;
 	bool computeCurvatureMap = false;
+	// 高度 Poisson 积分分辨率比例 (0.25, 1.0]；0.5 约可将 DCT/IDCT 耗时降至 1/4
+	float heightIntegrationScale = 1.0f;
 	// 合成图使用的虚拟光方向（单位向量）
 	cv::Vec3f syntheticLightDir{ 0.f, 0.f, 1.f };
 	// 灰度阈值（float 域），低于此值的观测视为阴影不参与拟合；0 表示不过滤
@@ -72,7 +75,7 @@ public:
 	~ImageBlend();
 	// 设置输入图片
 	ImageBlendError setImages(const std::vector<cv::Mat>& images);
-	// 设置融合模式和配置
+	// 设置融合模式和配置参数
 	ImageBlendError setConfig(ImageBlendMode mode, const ImageBlendConfig& config);
 	// 执行融合
 	ImageBlendError execute();
@@ -111,6 +114,8 @@ private:
 	void executeMaxValue();
 	void executeWeightedAverage(const WeightedAverageConfig& cfg);
 	void executePhotometricStereo(const PhotometricStereoConfig& cfg);
+	void clearPhotometricStereoPrecompute();
+	void updatePhotometricStereoPrecompute(const std::vector<LightSource>& lights);
 
 	bool imagesSet;
 	bool configSet;
@@ -123,4 +128,10 @@ private:
 	cv::Mat gradientMap;
 	cv::Mat albedoMap;
 	cv::Mat curvatureMap;
+	// 光度立体法预计算
+	std::vector<float> psInverseM_;
+	std::vector<float> psScaledLightsFlat_;
+	std::vector<float> psThresholdLutK4_;
+	std::vector<float> psThresholdLutK6_;
+	bool psPrecomputeReady_ = false;
 };
