@@ -231,6 +231,11 @@ namespace
 		return std::abs(dir.dot(dir) - 1.f) <= kUnitVectorTolerance;
 	}
 
+	bool isSupportedInputType(int type)
+	{
+		return type == CV_8UC1 || type == CV_32FC1;
+	}
+
 	struct ScaledLight
 	{
 		float sx = 0.f;
@@ -1010,18 +1015,33 @@ namespace
 
 		const int cols = size.width;
 		const int rows = size.height;
+		const int imgType = imgs[0].type();
 
 		// 行并行扫描，列并行累加
 		cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
 			for (int y = range.start; y < range.end; ++y)
 			{
-				uchar* dstRow = resultOut.ptr<uchar>(y);
-				for (int x = 0; x < cols; ++x)
+				if (imgType == CV_8UC1)
 				{
-					float sum = 0.f;
-					for (size_t i = 0; i < n; ++i)
-						sum += weights[i] * static_cast<float>(imgs[i].ptr<uchar>(y)[x]);
-					dstRow[x] = cv::saturate_cast<uchar>(sum);
+					uchar* dstRow = resultOut.ptr<uchar>(y);
+					for (int x = 0; x < cols; ++x)
+					{
+						float sum = 0.f;
+						for (size_t i = 0; i < n; ++i)
+							sum += weights[i] * static_cast<float>(imgs[i].ptr<uchar>(y)[x]);
+						dstRow[x] = cv::saturate_cast<uchar>(sum);
+					}
+				}
+				else
+				{
+					float* dstRow = resultOut.ptr<float>(y);
+					for (int x = 0; x < cols; ++x)
+					{
+						float sum = 0.f;
+						for (size_t i = 0; i < n; ++i)
+							sum += weights[i] * imgs[i].ptr<float>(y)[x];
+						dstRow[x] = sum;
+					}
 				}
 			}
 		});
@@ -1050,18 +1070,32 @@ namespace
 		const float ly = lightDir[1];
 		const float lz = lightDir[2];
 		const int cols = normalMap.cols;
+		const int outputType = resultOut.type();
 
 		cv::parallel_for_(cv::Range(0, normalMap.rows), [&](const cv::Range& range) {
 			for (int y = range.start; y < range.end; ++y)
 			{
 				const cv::Vec3f* normalRow = normalMap.ptr<cv::Vec3f>(y);
 				const float* albedoRow = albedoMap.ptr<float>(y);
-				uchar* dstRow = resultOut.ptr<uchar>(y);
-				for (int x = 0; x < cols; ++x)
+				if (outputType == CV_8UC1)
 				{
-					const cv::Vec3f& n = normalRow[x];
-					const float shade = std::max(0.f, n[0] * lx + n[1] * ly + n[2] * lz);
-					dstRow[x] = cv::saturate_cast<uchar>(albedoRow[x] * shade);
+					uchar* dstRow = resultOut.ptr<uchar>(y);
+					for (int x = 0; x < cols; ++x)
+					{
+						const cv::Vec3f& n = normalRow[x];
+						const float shade = std::max(0.f, n[0] * lx + n[1] * ly + n[2] * lz);
+						dstRow[x] = cv::saturate_cast<uchar>(albedoRow[x] * shade);
+					}
+				}
+				else
+				{
+					float* dstRow = resultOut.ptr<float>(y);
+					for (int x = 0; x < cols; ++x)
+					{
+						const cv::Vec3f& n = normalRow[x];
+						const float shade = std::max(0.f, n[0] * lx + n[1] * ly + n[2] * lz);
+						dstRow[x] = albedoRow[x] * shade;
+					}
 				}
 			}
 		});
@@ -1076,7 +1110,7 @@ namespace
 	{
 		ZoneScopedN("renderSyntheticImage");
 		resultOut.create(normalMap.size(), outputType);
-		if (renderSyntheticTryAvx2(normalMap, albedoMap, lightDir, resultOut))
+		if (outputType == CV_8UC1 && renderSyntheticTryAvx2(normalMap, albedoMap, lightDir, resultOut))
 			return;
 		renderSyntheticImageScalar(normalMap, albedoMap, lightDir, resultOut);
 	}
@@ -1151,7 +1185,7 @@ void ImageBlend::releaseAuxMaps()
 }
 
 // 验证输入图片
-// - 必须为灰度图，统一类型
+// - 必须为 CV_8UC1 或 CV_32FC1，统一类型
 // - 光度立体合成最少4张图片
 ImageBlendError ImageBlend::validateImages(const std::vector<cv::Mat>& images, size_t minCount)
 {
@@ -1163,7 +1197,9 @@ ImageBlendError ImageBlend::validateImages(const std::vector<cv::Mat>& images, s
 	}
 
 	const cv::Size size = images[0].size();
+	if (images[0].channels() != 1) return ImageBlendError::NotGrayscale;
 	const int type = images[0].type();
+	if (!isSupportedInputType(type)) return ImageBlendError::ImageTypeDifferent;
 	for (const auto& img : images)
 	{
 		if (img.size() != size) return ImageBlendError::SizeMismatch;
@@ -1183,6 +1219,8 @@ ImageBlendError ImageBlend::setImages(const std::vector<cv::Mat>& images)
 	imgs = images;
 	imagesSet = true;
 	configSet = false;
+	weightedAverageWeights_.clear();
+	clearPhotometricStereoPrecompute();
 	releaseOutputs();
 	return ImageBlendError::OK;
 }
@@ -1257,23 +1295,25 @@ ImageBlendError ImageBlend::setConfig(ImageBlendMode blendMode, const ImageBlend
 	config = blendConfig;
 	if (blendMode == ImageBlendMode::WeightedAverage)
 	{
-		auto& cfg = std::get<WeightedAverageConfig>(config);
+		const auto& cfg = std::get<WeightedAverageConfig>(config);
 		double weightSum = 0.0;
 		for (double w : cfg.weights) weightSum += w;
-		cfg.normalizedWeights.resize(cfg.weights.size());
+		weightedAverageWeights_.resize(cfg.weights.size());
 		// 归一化权重
 		for (size_t i = 0; i < cfg.weights.size(); ++i)
-			cfg.normalizedWeights[i] = static_cast<float>(cfg.weights[i] / weightSum);
+			weightedAverageWeights_[i] = static_cast<float>(cfg.weights[i] / weightSum);
 		clearPhotometricStereoPrecompute();
 	}
 	else if (blendMode == ImageBlendMode::PhotometricStereo)
 	{
+		weightedAverageWeights_.clear();
 		const auto& cfg = std::get<PhotometricStereoConfig>(config);
 		// 预计算用于灰度阈值过滤的查找表
 		updatePhotometricStereoPrecompute(cfg.lightSystem.lights);
 	}
 	else
 	{
+		weightedAverageWeights_.clear();
 		clearPhotometricStereoPrecompute();
 	}
 	configSet = true;
@@ -1315,10 +1355,10 @@ void ImageBlend::executeMaxValue()
 }
 
 // 加权平均融合
-void ImageBlend::executeWeightedAverage(const WeightedAverageConfig& cfg)
+void ImageBlend::executeWeightedAverage()
 {
 	ZoneScopedN("executeWeightedAverage");
-	weightedAverageSinglePass(imgs, cfg.normalizedWeights, result);
+	weightedAverageSinglePass(imgs, weightedAverageWeights_, result);
 }
 
 // 光度立体法融合
@@ -1543,7 +1583,7 @@ ImageBlendError ImageBlend::execute()
 		break;
 	case ImageBlendMode::WeightedAverage:
 		releaseAuxMaps();
-		executeWeightedAverage(std::get<WeightedAverageConfig>(config));
+		executeWeightedAverage();
 		break;
 	case ImageBlendMode::PhotometricStereo:
 		if (imgs.size() < 4) return ImageBlendError::ImageNumberError;
@@ -1554,10 +1594,22 @@ ImageBlendError ImageBlend::execute()
 	return ImageBlendError::OK;
 }
 
-cv::Mat ImageBlend::getResult()
+ImageBlendOutputMap ImageBlend::getResult()
 {
-	if (result.empty()) return cv::Mat();
-	return result;
+	ImageBlendOutputMap outputs;
+	if (!result.empty())
+		outputs.emplace(ImageBlendOutputName::Result, result);
+	if (!normalMap.empty())
+		outputs.emplace(ImageBlendOutputName::NormalMap, normalMap);
+	if (!heightMap.empty())
+		outputs.emplace(ImageBlendOutputName::HeightMap, heightMap);
+	if (!gradientMap.empty())
+		outputs.emplace(ImageBlendOutputName::GradientMap, gradientMap);
+	if (!albedoMap.empty())
+		outputs.emplace(ImageBlendOutputName::AlbedoMap, albedoMap);
+	if (!curvatureMap.empty())
+		outputs.emplace(ImageBlendOutputName::CurvatureMap, curvatureMap);
+	return outputs;
 }
 
 cv::Mat ImageBlend::getNormalMap()

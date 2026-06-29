@@ -1,5 +1,6 @@
 #pragma once
 #include <opencv2/opencv.hpp>
+#include <map>
 #include <variant>
 #include <vector>
 #include "LightTypes.h"
@@ -28,6 +29,25 @@ enum class ImageBlendMode
 	// 光度立体法融合
 	PhotometricStereo,
 };
+
+enum class ImageBlendOutputName
+{
+	// 融合结果图
+	Result,
+	// 法线图
+	NormalMap,
+	// 高度图
+	HeightMap,
+	// 梯度图
+	GradientMap,
+	// 漫反射图
+	AlbedoMap,
+	// 曲率图
+	CurvatureMap,
+};
+
+using ImageBlendOutputMap = std::map<ImageBlendOutputName, cv::Mat>;
+
 // 最大值融合配置
 struct MaxValueConfig
 {
@@ -37,8 +57,6 @@ struct MaxValueConfig
 struct WeightedAverageConfig
 {
 	std::vector<double> weights;
-	// setConfig 内根据 weights 预计算
-	std::vector<float> normalizedWeights;
 };
 
 // 光度立体法输出选项（梯度图/高度图/曲率图较慢，按需计算）
@@ -73,7 +91,8 @@ class ImageBlend
 public:
 	ImageBlend();
 	~ImageBlend();
-	// 设置输入图片
+	// 设置输入图片：仅支持 CV_8UC1 / CV_32FC1，内部保留 cv::Mat 共享引用，不 clone 像素数据。
+	// 调用方在 execute 前修改原图会影响本对象后续计算。
 	ImageBlendError setImages(const std::vector<cv::Mat>& images);
 	// 设置融合模式和配置参数
 	ImageBlendError setConfig(ImageBlendMode mode, const ImageBlendConfig& config);
@@ -81,38 +100,39 @@ public:
 	ImageBlendError execute();
 	// 平板标定：输入>=4张灰度图与共用俯仰角 pitchDeg（度，[0,90)），输出与输入等数量的 LightSource
 	// 偏航角由亮区质心相对图像中心估计，俯仰角由 pitchDeg 给定，不使用相机内参
-	ImageBlendError executeFlatCalibration(
+	static ImageBlendError executeFlatCalibration(
 		const std::vector<cv::Mat>& images,
 		float pitchDeg,
 		std::vector<LightSource>& outLights);
 	// 漫反射球标定：输入>=4张灰度图，输出与输入等数量的 LightSource（按序一一对应）
 	// 光方向由球内灰度加权质心处的球面法线估计（Lambert 模型），不使用相机内参
-	ImageBlendError executeSphereCalibration(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights);
-	// 获取融合结果
-	cv::Mat getResult();
-	// 获取法线图
+	static ImageBlendError executeSphereCalibration(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights);
+	// 获取融合结果和所有已计算输出：map 中始终包含融合结果；光度立体会包含法线/漫反射，以及 config 启用的高度/梯度/曲率图。
+	// 返回的 cv::Mat 与内部缓存共享数据；如需长期持有或修改，请在调用方 clone。
+	ImageBlendOutputMap getResult();
+	// 获取法线图：返回共享 cv::Mat 头。
 	cv::Mat getNormalMap();
-	// 获取高度图
+	// 获取高度图：返回共享 cv::Mat 头。
 	cv::Mat getHeightMap();
-	// 获取梯度图
+	// 获取梯度图：返回共享 cv::Mat 头。
 	cv::Mat getGradientMap();
-	// 获取漫反射图
+	// 获取漫反射图：返回共享 cv::Mat 头。
 	cv::Mat getAlbedoMap();
-	// 获取曲率图
+	// 获取曲率图：返回共享 cv::Mat 头。
 	cv::Mat getCurvatureMap();
 private:
 	void releaseOutputs();
 	void releaseAuxMaps();
 	void initPhotometricStereoMaps(const cv::Size& size, const PhotometricStereoOutputFlags& flags);
-	ImageBlendError validateImages(const std::vector<cv::Mat>& images, size_t minCount = 1);
+	static ImageBlendError validateImages(const std::vector<cv::Mat>& images, size_t minCount = 1);
 	ImageBlendError validateConfig(ImageBlendMode blendMode, const ImageBlendConfig& config);
-	ImageBlendError calibrateFlatPanel(
+	static ImageBlendError calibrateFlatPanel(
 		const std::vector<cv::Mat>& images,
 		float pitchDeg,
 		std::vector<LightSource>& outLights);
-	ImageBlendError calibrateSphere(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights);
+	static ImageBlendError calibrateSphere(const std::vector<cv::Mat>& images, std::vector<LightSource>& outLights);
 	void executeMaxValue();
-	void executeWeightedAverage(const WeightedAverageConfig& cfg);
+	void executeWeightedAverage();
 	void executePhotometricStereo(const PhotometricStereoConfig& cfg);
 	void clearPhotometricStereoPrecompute();
 	void updatePhotometricStereoPrecompute(const std::vector<LightSource>& lights);
@@ -128,6 +148,8 @@ private:
 	cv::Mat gradientMap;
 	cv::Mat albedoMap;
 	cv::Mat curvatureMap;
+	// 加权平均预计算
+	std::vector<float> weightedAverageWeights_;
 	// 光度立体法预计算
 	std::vector<float> psInverseM_;
 	std::vector<float> psScaledLightsFlat_;

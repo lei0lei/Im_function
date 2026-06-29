@@ -47,7 +47,10 @@ void testBlend()
 			&& blend.setConfig(ImageBlendMode::MaxValue, MaxValueConfig{}) == ImageBlendError::OK
 			&& blend.execute() == ImageBlendError::OK)
 		{
-			cv::imwrite("blend_max.jpg", blend.getResult());
+			const ImageBlendOutputMap outputs = blend.getResult();
+			auto resultIt = outputs.find(ImageBlendOutputName::Result);
+			if (resultIt != outputs.end())
+				cv::imwrite("blend_max.jpg", resultIt->second);
 		}
 	}
 
@@ -58,7 +61,10 @@ void testBlend()
 			&& blend.setConfig(ImageBlendMode::WeightedAverage, WeightedAverageConfig{ { 0.4, 0.3, 0.2, 0.1 } }) == ImageBlendError::OK
 			&& blend.execute() == ImageBlendError::OK)
 		{
-			cv::imwrite("blend_avg.jpg", blend.getResult());
+			const ImageBlendOutputMap outputs = blend.getResult();
+			auto resultIt = outputs.find(ImageBlendOutputName::Result);
+			if (resultIt != outputs.end())
+				cv::imwrite("blend_avg.jpg", resultIt->second);
 		}
 	}
 }
@@ -129,21 +135,31 @@ static PhotometricStereoOutputFlags photometricStereoOutputsWithAuxMaps()
 
 static void writePhotometricStereoOutputs(ImageBlend& blend, const std::string& pathPrefix)
 {
-	cv::imwrite(pathPrefix + ".jpg", blend.getResult());
-	cv::imwrite(pathPrefix + "_normal.jpg", normalMapToBgr8(blend.getNormalMap()));
-	cv::imwrite(pathPrefix + "_albedo.jpg", floatMapToGray8(blend.getAlbedoMap()));
+	const ImageBlendOutputMap outputs = blend.getResult();
 
-	const cv::Mat gradientMap = blend.getGradientMap();
-	if (!gradientMap.empty())
-		cv::imwrite(pathPrefix + "_gradient.jpg", gradientMapToGray8(gradientMap));
+	auto resultIt = outputs.find(ImageBlendOutputName::Result);
+	if (resultIt != outputs.end())
+		cv::imwrite(pathPrefix + ".jpg", resultIt->second);
 
-	const cv::Mat heightMap = blend.getHeightMap();
-	if (!heightMap.empty())
-		cv::imwrite(pathPrefix + "_height.jpg", floatMapToGray8(heightMap));
+	auto normalIt = outputs.find(ImageBlendOutputName::NormalMap);
+	if (normalIt != outputs.end())
+		cv::imwrite(pathPrefix + "_normal.jpg", normalMapToBgr8(normalIt->second));
 
-	const cv::Mat curvatureMap = blend.getCurvatureMap();
-	if (!curvatureMap.empty())
-		cv::imwrite(pathPrefix + "_curvature.jpg", floatMapToGray8(curvatureMap));
+	auto albedoIt = outputs.find(ImageBlendOutputName::AlbedoMap);
+	if (albedoIt != outputs.end())
+		cv::imwrite(pathPrefix + "_albedo.jpg", floatMapToGray8(albedoIt->second));
+
+	auto gradientIt = outputs.find(ImageBlendOutputName::GradientMap);
+	if (gradientIt != outputs.end())
+		cv::imwrite(pathPrefix + "_gradient.jpg", gradientMapToGray8(gradientIt->second));
+
+	auto heightIt = outputs.find(ImageBlendOutputName::HeightMap);
+	if (heightIt != outputs.end())
+		cv::imwrite(pathPrefix + "_height.jpg", floatMapToGray8(heightIt->second));
+
+	auto curvatureIt = outputs.find(ImageBlendOutputName::CurvatureMap);
+	if (curvatureIt != outputs.end())
+		cv::imwrite(pathPrefix + "_curvature.jpg", floatMapToGray8(curvatureIt->second));
 }
 
 // 光度立体融合测试
@@ -182,10 +198,9 @@ void testFlatCalibration()
 
 	std::vector<cv::Mat> images = { img1, img2, img3, img4 };
 
-	ImageBlend calibrator;
 	std::vector<LightSource> lights;
 	const float flatPitchDeg = 45.f; // 手动测量的共用俯仰角 [0, 90)，度
-	if (calibrator.executeFlatCalibration(images, flatPitchDeg, lights) != ImageBlendError::OK) return;
+	if (ImageBlend::executeFlatCalibration(images, flatPitchDeg, lights) != ImageBlendError::OK) return;
 
 	LightSystem lightSystem;
 	lightSystem.lights = lights;
@@ -212,9 +227,8 @@ void testSphereCalibration()
 
 	std::vector<cv::Mat> images = { img1, img2, img3, img4 };
 
-	ImageBlend calibrator;
 	std::vector<LightSource> lights;
-	if (calibrator.executeSphereCalibration(images, lights) != ImageBlendError::OK) return;
+	if (ImageBlend::executeSphereCalibration(images, lights) != ImageBlendError::OK) return;
 
 	LightSystem lightSystem;
 	lightSystem.lights = lights;
